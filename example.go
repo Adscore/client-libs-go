@@ -2,6 +2,7 @@ package main
 
 import (
 	"adscore/adscore"
+	"adscore/config"
 	"fmt"
 )
 
@@ -11,7 +12,16 @@ func main() {
 	userAgent := ""
 	ipAddresses := []string{""}
 	signRole := "master"
-	s := adscore.NewSignature(signature, key, ipAddresses, userAgent, signRole, 36000000000)
+	cfg := &config.Config{
+		Signature:     signature,
+		Key:           key,
+		IpAddresses:   ipAddresses,
+		UseRawHmacKey: false,
+		UserAgent:     userAgent,
+		Expire:        21660,
+		SignRole:      signRole,
+	}
+	s := adscore.NewSignature(cfg)
 	verify, err := s.Verify()
 	if err != nil {
 		panic(err)

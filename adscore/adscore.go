@@ -1,32 +1,31 @@
 package adscore
 
 import (
+	"adscore/config"
 	"adscore/errors"
 	"adscore/parser"
 	"adscore/utils"
 	"bytes"
+	"crypto"
+	"crypto/ecdsa"
 	"crypto/hmac"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/asn1"
+	"encoding/pem"
 	"fmt"
+	"math/big"
+	"net"
 	"time"
 )
 
 const SignatureErrorExpired = 11
 const HashSha256 = 1
 const SignSha256 = 2
-const UseRawHmacKey = false
-
-type payload struct {
-	signature   string
-	key         string
-	ipAddresses []string
-	userAgent   string
-	signRole    string `default:"customer"`
-	expire      int64  `default:"3600"`
-}
 
 type Signature struct {
-	payload payload
+	cfg *config.Config
 }
 
 var Results = map[int]map[string]string{
@@ -48,16 +47,9 @@ var Results = map[int]map[string]string{
 	},
 }
 
-func NewSignature(signature string, key string, ipAddresses []string, userAgent string, signRole string, expire int64) *Signature {
+func NewSignature(cfg *config.Config) *Signature {
 	return &Signature{
-		payload{
-			signature:   signature,
-			key:         key,
-			ipAddresses: ipAddresses,
-			userAgent:   userAgent,
-			signRole:    signRole,
-			expire:      expire,
-		},
+		cfg: cfg,
 	}
 }
 
@@ -73,31 +65,41 @@ func (s Signature) Verify() (map[string]interface{}, error) {
 }
 
 func (s Signature) isExpired(requestTime uint) bool {
-	return time.Now().Unix()-int64(requestTime) > s.payload.expire
+	return time.Now().Unix()-int64(requestTime) > s.cfg.Expire
 }
 
 func (s Signature) verifyTokens() (map[string]interface{}, error) {
 	v4Parser := &parser.V4Parser{}
-	data, err := v4Parser.Parse(s.payload.signature)
+	data, err := v4Parser.Parse(s.cfg.Signature)
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := data[s.payload.signRole+"Token"]; !ok {
+	if _, ok := data[s.cfg.SignRole+"Token"]; !ok {
 		return nil, errors.NewSignatureError("Invalid sign role", 2)
 	}
-	signType := data[s.payload.signRole+"SignType"]
+	signType := data[s.cfg.SignRole+"SignType"]
 	var token []byte
-	for _, ipAddress := range s.payload.ipAddresses {
+	for _, ipAddress := range s.cfg.IpAddresses {
 		longIp, err := utils.Ip2long(ipAddress)
 		if err != nil {
-			return nil, err
+			continue
 		}
 		if longIp != 0 {
 			ipAddress = utils.Long2ip(longIp)
-			token = data[s.payload.signRole+"Token"].([]byte)
+			if _, ok := data[s.cfg.SignRole+"Token"]; !ok {
+				continue
+			}
+			token = data[s.cfg.SignRole+"Token"].([]byte)
 		} else {
-			//TODO check ipV6
-			token = data[s.payload.signRole+"TokenV6"].([]byte)
+			ip := net.ParseIP(ipAddress)
+			if ip == nil {
+				continue
+			}
+			ipAddress = ip.String()
+			if _, ok := data[s.cfg.SignRole+"TokenV6"]; !ok {
+				continue
+			}
+			token = data[s.cfg.SignRole+"TokenV6"].([]byte)
 			if token == nil {
 				continue
 			}
@@ -120,7 +122,10 @@ func (s Signature) verifyTokens() (map[string]interface{}, error) {
 					}, nil
 				}
 			case SignSha256:
-				xValid := s.verifyData(signatureBase, token, "sha256")
+				xValid, err := s.verifyData(signatureBase, token)
+				if err != nil {
+					return nil, err
+				}
 				if xValid {
 					return map[string]interface{}{
 						"verdict":       meta["verdict"],
@@ -139,30 +144,63 @@ func (s Signature) verifyTokens() (map[string]interface{}, error) {
 }
 
 func (s Signature) getBase(result int, requestTime uint, signatureTime uint, ipAddress string) string {
-	return fmt.Sprintf("%d\n%d\n%d\n%s\n%s", result, requestTime, signatureTime, ipAddress, s.payload.userAgent)
+	return fmt.Sprintf("%d\n%d\n%d\n%s\n%s", result, requestTime, signatureTime, ipAddress, s.cfg.UserAgent)
 }
 
 func (s Signature) hashData(data string, algorithm string) ([]byte, error) {
 	if algorithm != "sha256" {
 		return nil, errors.SignatureCryptError("Unsupported hash algorithm: " + algorithm)
 	}
-	bKey := []byte(s.payload.key)
-	var err error
-	if !UseRawHmacKey {
-		bKey, err = utils.FromBase64(s.payload.key)
-		if err != nil {
-			return nil, err
-		}
+	bKey, err := s.getSignature()
+	if err != nil {
+		return nil, err
 	}
+
 	mac := hmac.New(sha256.New, bKey)
 	mac.Write([]byte(data))
 	return mac.Sum(nil), nil
 }
 
-func (s Signature) verifyData(data string, signature []byte, algorithm string) bool {
-	return false
-	//block, _ := pem.Decode([]byte(s.payload.key))
-	//pub, err := x509.ParsePKIXPublicKey(block.Bytes)
-	//if err != nil {         log.Fatal(err)     }
-	//rsa.VerifyPKCS1v15(pub.(), crypto.SHA256, digest[:], decodedSignature)
+func (s Signature) verifyData(data string, signature []byte) (bool, error) {
+	bKey, err := s.getSignature()
+	if err != nil {
+		return false, err
+	}
+	block, _ := pem.Decode(bKey)
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return false, err
+	}
+	h := sha256.New()
+	h.Write([]byte(data))
+	switch pub.(type) {
+	case *ecdsa.PublicKey:
+		var esig struct {
+			R, S *big.Int
+		}
+		if _, err := asn1.Unmarshal(signature, &esig); err != nil {
+			return false, err
+		}
+		verify := ecdsa.Verify(pub.(*ecdsa.PublicKey), h.Sum(nil), esig.R, esig.S)
+		return verify, nil
+	case *rsa.PublicKey:
+		err = rsa.VerifyPKCS1v15(pub.(*rsa.PublicKey), crypto.SHA256, h.Sum(nil), bKey)
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, errors.NewSignatureError("signature verify failed", 0)
+}
+
+func (s Signature) getSignature() ([]byte, error) {
+	bKey := []byte(s.cfg.Key)
+	var err error
+	if !s.cfg.UseRawHmacKey {
+		bKey, err = utils.FromBase64(s.cfg.Key)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return bKey, err
 }

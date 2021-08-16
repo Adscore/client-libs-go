@@ -8,20 +8,6 @@ import (
 	"strings"
 )
 
-func Substr(input string, start int, length int) string {
-	asRunes := []rune(input)
-
-	if start >= len(asRunes) {
-		return ""
-	}
-
-	if start+length > len(asRunes) {
-		length = len(asRunes) - start
-	}
-
-	return string(asRunes[start : start+length])
-}
-
 func CharAt(str string, idx int) string {
 	if idx < 0 || idx >= len(str) {
 		return "0"
@@ -35,6 +21,10 @@ func Ip2long(ipAddr string) (uint32, error) {
 		return 0, errors.New("wrong ipAddr format")
 	}
 	ip = ip.To4()
+	if ip == nil {
+		// not an IP v4
+		return 0, nil
+	}
 	return binary.BigEndian.Uint32(ip), nil
 }
 
