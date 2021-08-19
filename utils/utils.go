@@ -37,6 +37,7 @@ func Long2ip(ipLong uint32) string {
 func FromBase64(signature string) ([]byte, error) {
 	signature = strings.ReplaceAll(signature, "-", "+")
 	signature = strings.ReplaceAll(signature, "_", "/")
+	signature = strings.ReplaceAll(signature, "=", "")
 	decoded, err := base64.RawStdEncoding.DecodeString(signature)
 	return decoded, err
 }
